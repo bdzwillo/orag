@@ -3,18 +3,18 @@ orag - run offline rag queries with ollama backend
 The `orag` command line tool combines content retrieved from local text documents with 
 the [LLMs](https://ollama.com/library) supported by the [ollama](https://github.com/ollama/ollama) backend.
 Like ollama (offline llama) it keeps the document data required for
-[retrievel-augmented generation (RAG)](https://en.wikipedia.org/wiki/Retrieval-augmented_generation) offline,
+retrieval-augmented generation ([RAG](https://en.wikipedia.org/wiki/Retrieval-augmented_generation)) offline,
 so that no private information is exposed to the internet.
 
 The tool is implemented in python using the [langchain](https://python.langchain.com/docs/introduction/) framework,
 which supports all kinds of backends for LLMs and [vector databases](https://en.wikipedia.org/wiki/Vector_database)
-so that they are easyly composable with the the pre- and postprocessing of document data.
+so that they are easily composable with the the pre- and post-processing of document data.
 
 The [FAISS](https://github.com/facebookresearch/faiss) vector store is used to store and retrieve
 text chunks of the local documents. The most significant matches are included in the prompt for a LLM query.
 
 Vector stores require a separate embedding model to convert text sequences
-to [emabedding](https://en.wikipedia.org/wiki/Embedding_(machine_learning)) vectors.
+to [embedding](https://en.wikipedia.org/wiki/Embedding_(machine_learning)) vectors.
 The embedding models differ from LLMs in that they encode the representation for
 the current state, while LLMs encode the weights used to predict the next word
 for text generation.
@@ -66,7 +66,7 @@ All documents that are supposed to be queried together, have first to be
 added to a local db directory where the weights for the embedding model
 are stored (also called 'collation' in some vector stores). [FAISS](https://github.com/facebookresearch/faiss)
 is an in-memory vector store. For persistent storage it just supports 
-simple sequencialisation via load() and store() operations. The
+simple serialization via load() and store() operations. The
 complete db is loaded for queries and rewritten on updates.
 The default is to use a '.faiss/<dbname>/' subdir in the current directory. 
 ```
@@ -90,7 +90,7 @@ the content to the learned attributes of the model.
 
 
 A query to the LLM first converts the query text to an embedding that is used 
-in a similatity search (cosinus similarity) to retrieve the 4 highest ranking
+in a similarity search (cosine similarity) to retrieve the 4 highest ranking
 chunks stored in the FAISS db. The text of these chunks is added to the LLM
 prompt to make the local knowledge available for the query (the count of chunks
 to retrieve can be changed with the `--top_k` option). The embedding model used
@@ -111,7 +111,7 @@ The `orag` tool has to load the complete db for each query call. This is
 acceptable for a local operation. The LLM query runs longer than the load
 time, when not too many chunks are stored in a single db directory.
 
-To avoid this overhead the `orag` tool also supports a `chat` cmd that allows
+To avoid this overhead the `orag` tool also supports a `chat` command that allows
 to pass multiple consecutive queries to the same FAISS db.
 ```
 > orag test chat what is the purpose of the chat command?
@@ -120,10 +120,10 @@ Performance
 -----------
 Even if small LLMs are already usable when ollama executes them per CPU,
 a local GPU like the RTX 5070 Ti with 16GB runs most queries in less than
-a second (Note: the RTX 5070 Ti delivers in avarage twice the token rate of
+a second (Note: the RTX 5070 Ti delivers in average twice the token rate of
 a RTX 4060 Ti):
 ```
-$ orag -v test query summerize the FAISS usage
+$ orag -v test query summarize the FAISS usage
   Here is a summary of the FAISS usage:..
 
   prompt tokens  867 duration 189.61 msec ( 4572.50 tok/sec)
