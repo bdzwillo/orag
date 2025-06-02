@@ -1,0 +1,224 @@
+#!/usr/bin/python3
+#
+# orag - run offline rag queries with ollama backend
+#
+# A local FAISS vector store is used to store and retrieve text chunks.
+# The most significant matches are included in the prompt for the LLM query.
+#
+__author__  = "Barnim Dzwillo"
+__version__ = '0.9.1'
+
+import argparse, hashlib, yaml, json, sys, os
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_ollama import OllamaEmbeddings
+from langchain_ollama import OllamaLLM
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import TextLoader
+from langchain_community.vectorstores import FAISS
+# for token usage
+from langchain_core.callbacks.base import BaseCallbackHandler
+from langchain_core.outputs.llm_result import LLMResult
+
+def abbr(obj, size=50):
+    if isinstance(obj, str):
+        obj = obj.replace("\n", '.')
+        if len(obj) > size:
+            obj = obj[:size-2] + '..'
+    return obj
+
+def print_entry(index, doc):
+    print(f"{index:3d}: {doc.metadata['source']:32s} id:{abbr(doc.id,10)} off:{doc.metadata['start_index']:6d} len:{len(doc.page_content):5d} {abbr(doc.page_content,50)}")
+
+def list_db(db_dir, embeddings):
+    if os.path.exists(db_dir):
+        vectorstore = FAISS.load_local(db_dir, embeddings, allow_dangerous_deserialization=True)
+        #print(vectorstore.index_to_docstore_id)
+        for i, id in vectorstore.index_to_docstore_id.items():
+            doc = vectorstore.docstore.search(id)
+            print_entry(i+1, doc)
+
+def add_files(db_dir, files, embeddings, size=1000, overlap=200, verbose=0):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=size, chunk_overlap=overlap, add_start_index=True, strip_whitespace=True)
+
+    docs = []
+    for file in files:
+        #loader = TextLoader(file, autodetect_encoding=True)
+        loader = TextLoader(file, encoding='iso-8859-1')
+        full_docs = loader.load()
+        docs = docs + text_splitter.split_documents(full_docs)
+
+    # FAISS.add_texts() uses a random str(uuid.uuid4()) as default id - for dedup use custom hash.
+    # see: https://docs.python.org/3/library/uuid.html
+    #      ids = [str(uuid.uuid4()) for _ in texts]
+    # FAISS.add_texts() will fail for duplicate ids (Tried to add ids that already exist),
+    # so existing chunks are removed before.
+    # The vectorstores.from_documents() method does not allow to pass custom ids,
+    # so have to use the low level FAISS.from_texts() method instead.
+    # see: https://api.python.langchain.com/en/latest/_modules/langchain_core/vectorstores.html#VectorStore.from_documents
+    #      https://api.python.langchain.com/en/latest/_modules/langchain_community/vectorstores/faiss.html#FAISS.from_texts
+    # 
+    for d in docs:
+        d.id = hashlib.sha256(d.page_content.encode()).hexdigest()
+    ids = [d.id for d in docs]
+    #print(ids)
+
+    if verbose:
+        print("Chunks created:", len(docs))
+        for i in range(len(docs)):
+            print_entry(i+1, docs[i])
+
+    if os.path.exists(db_dir):
+        print(f"WARN: {db_dir} already exists")
+        vectorstore = FAISS.load_local(db_dir, embeddings, allow_dangerous_deserialization=True)
+        old_ids = [d.id for d in vectorstore.get_by_ids(ids)]
+        new_ids = set(ids).difference(old_ids)
+        new_docs = [d for d in docs if d.id in new_ids]
+        print(f"Chunks old: {len(old_ids)} new: {len(new_ids)}")
+        #new_store = FAISS.from_documents(documents=new_docs, embedding=embeddings)
+        #vectorstore.merge_from(new_store)
+        if len(new_docs) > 0:
+            texts = [d.page_content for d in new_docs]
+            metadatas = [d.metadata for d in new_docs]
+            ids = [d.id for d in new_docs]
+            ids = vectorstore.add_texts(texts, metadatas, ids)
+            vectorstore.save_local(db_dir)
+    else:
+        #vectorstore = FAISS.from_documents(documents=docs, embedding=embeddings)
+        texts = [d.page_content for d in docs]
+        metadatas = [d.metadata for d in docs]
+        vectorstore = FAISS.from_texts(texts, embeddings, metadatas, ids)
+        vectorstore.save_local(db_dir)
+
+# retrieve the most similar document chunks. 
+# vectorstore.as_retriever() does not return the similarity score,
+# so have to use the low level FAISS.imilarity_search_with_score() API.
+#
+def query_context(vectorstore, query, top_k=4, verbose=0):
+    #retriever = vectorstore.as_retriever(search_kwargs={'k': args.top_k})
+    #docs = retriever.invoke(query)
+    docs, scores = zip(*vectorstore.similarity_search_with_score(query, k=top_k))
+    for doc, score in zip(docs, scores):
+        doc.metadata["score"] = score
+
+    # show content & score of retrieved documents
+    if verbose:
+        print("Chunks retrieved:", len(docs))
+        for i in range(len(docs)):
+            print(f"{i+1:2d}: {docs[i].metadata['source']:32s} id:{abbr(docs[i].id,10)} score:{docs[i].metadata['score']:.2f} off:{docs[i].metadata['start_index']:6d} {abbr(docs[i].page_content,50)}")
+        print()
+
+    docs_content = "\n\n".join(doc.page_content for doc in docs)
+    return docs_content
+
+# main program
+#
+formatter_class = lambda prog: argparse.HelpFormatter(prog, max_help_position=36)
+parser = argparse.ArgumentParser(prog=os.path.basename(__file__), formatter_class=formatter_class)
+parser.add_argument("--version", action="version", version=f"%(prog)s " + __version__)
+parser.add_argument('-v', "--verbose", action="count", default=0, help="set output verbosity")
+parser.add_argument('-c', "--conf", help="read custom config file (default: .oragcfg, ~/.oragcfg)")
+parser.add_argument('-d', "--dir", default='.faiss', help="database directory")
+parser.add_argument('-e', "--embed", default='nomic-embed-text', help="embeddings model to use")
+parser.add_argument('-m', "--model", default='llama3.2', help="llm to use") # or 'gemma3:12b'
+parser.add_argument('-s', "--size", type=int, default=1000, help="chunk size for splitter")
+parser.add_argument('-o', "--overlap", type=int, default=200, help="chunk overlap for splitter")
+parser.add_argument('-k', "--top_k", type=int, default=4, help="include top k documents in prompt")
+parser.add_argument('db', help="database collection name")
+parser.add_argument('cmd', help="add <files> | query <text> | chat <text> | list")
+parser.add_argument('args', nargs="*", help="cmd arguments")
+args = parser.parse_args()
+
+# optionally read defaults from config file in yaml 'key: value' format.
+# .oragcfg has precedence over ~/.oragcfg
+#
+if args.conf:
+    path = args.conf
+else:
+    path = '.oragcfg'
+    if not os.path.exists(path):
+        path = os.path.expanduser(os.path.join('~', path))
+if os.path.exists(path):
+    with open(path, 'r') as f:
+        #parser.set_defaults(**json.load(f))
+        conf = yaml.safe_load(f)
+        if conf:
+            parser.set_defaults(**conf)
+            # reload args to override values from config file with passed args
+            args = parser.parse_args()
+elif args.conf:
+    sys.exit(f"failed to config file: {args.conf} does not exists")
+
+if args.verbose > 1:
+    print(yaml.dump(vars(args), indent=4, sort_keys=True))
+
+db = os.path.join(os.path.expanduser(args.dir), args.db)
+embeddings = OllamaEmbeddings(model=args.embed)
+query = ''
+
+match args.cmd:
+    case 'list':
+        list_db(db, embeddings)
+        sys.exit(0)
+    case 'add':
+        if len(args.args) > 0:
+            files = args.args
+            add_files(db, files, embeddings, size=args.size, overlap=args.overlap, verbose=args.verbose)
+            sys.exit(0)
+    case 'query' | 'chat':
+        if len(args.args) > 0:
+            query = ' '.join(args.args)
+    case _:
+        parser.print_help()
+        sys.exit(0)
+
+# query ollama model with results from local vector db dir
+#
+if not os.path.exists(db):
+    sys.exit(f"failed to load db: {db} does not exists")
+
+class UsageHandler(BaseCallbackHandler):
+    def print_rate(self, what, tokens, duration_ns):
+        msec = duration_ns / (1000 * 1000) or 1
+        rate = (tokens * 1000) / msec
+        print(f"  {what:6s} tokens {tokens:4d} duration {msec:6.02f} msec ({rate:8.02f} tok/sec)")
+    def on_llm_end(self, response: LLMResult, **kwargs) -> None:
+        info = response.generations[0][0].generation_info
+        #print(info)
+        if args.verbose:
+            print("Statistics:")
+            self.print_rate('prompt', info['prompt_eval_count'], info['prompt_eval_duration'])
+            self.print_rate('eval', info['eval_count'], info['eval_duration'])
+            print()
+
+template = """
+Use the following context to answer the question.
+Context: {context}
+Question: {question}
+Answer:"""
+
+vectorstore = FAISS.load_local(db, embeddings, allow_dangerous_deserialization=True)
+
+llm = OllamaLLM(model=args.model)
+prompt = PromptTemplate.from_template(template) 
+#chain = prompt | llm | StrOutputParser()
+chain = prompt | llm
+
+if args.cmd == 'chat':
+    # break chat loop with ctrl-d
+    try:
+        if not query:
+            query = input("Your question> ")
+        while True:
+            if query:
+                docs_content = query_context(vectorstore, query, top_k=args.top_k, verbose=args.verbose)
+                response = chain.invoke({'question': query, 'context': docs_content})
+                print(response)
+            query = input("> ")
+    except EOFError as e:
+        print(e)
+    sys.exit(0)
+
+docs_content = query_context(vectorstore, query, top_k=args.top_k, verbose=args.verbose)
+response = chain.invoke({'question': query, 'context': docs_content}, config={"callbacks": [UsageHandler()]})
+print(response)
